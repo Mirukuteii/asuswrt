@@ -310,7 +310,7 @@ class AsusWrtSensor(Entity):
                     dtx = txnow - self._tx
                     if dtx <= 0:
                         dtx += 4294967296
-                    self._state = round(((txnow-self._tx)/((ttnow-self._tt).seconds)/1024),3)
+                    self._state = round((dtx/((ttnow-self._tt).seconds)/1024),3)
                     if self.state <= 0 :
                         self.attributes['debug_tx0'] = self._tx
                         self.attributes['debug_txn'] = txnow
