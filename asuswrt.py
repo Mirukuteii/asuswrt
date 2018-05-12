@@ -1,8 +1,8 @@
 """
 Support for ASUSWRT routers.
-# Version: 0.04
+# Version: 0.06
 # Author:  Mirukuteii
-# Created: 2018-5-10
+# Created: 2018-5-13
 """
 
 import logging
@@ -21,6 +21,8 @@ from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.util import Throttle
 
 import re
+import socket
+import telnetlib
 
 REQUIREMENTS = ['pexpect==4.0.1']
 
@@ -58,18 +60,20 @@ _NET_COND = {
     'router_net_mac': ['Router MAC', None, 'mdi:ethernet'],
     'router_net_wan_ip': ['Wan IP', None, 'mdi:ethernet'],
     'router_net_lan_ip': ['Lan IP', None, 'mdi:ethernet'],
-    'router_net_wan_downspd': ['Internet Download Speed(AVR)', 'KiB', 'mdi:ethernet'],
-    'router_net_wan_upspd': ['Internet Upload Speed(AVR)', 'KiB', 'mdi:ethernet'],
+    'router_net_wan_downspd': ['Internet Download Speed(AVR)', 'KiB', 'mdi:arrow-down-bold-circle'],
+    'router_net_wan_upspd': ['Internet Upload Speed(AVR)', 'KiB', 'mdi:arrow-up-bold-circle'],
 }
 _WIFI_COND = {
     'router_wifi_24G_temp': ['Chip Temperature(2.4G)', None, 'mdi:thermometer'],
     'router_wifi_5G_temp': ['Chip Temperature(5G)', None, 'mdi:thermometer'],
-    'router_wifi_24G_txpwr': ['Transmit Power(2.4G)', 'dBm', 'mdi:wifi'],
-    'router_wifi_5G_txpwr': ['Transmit Power(5G)', 'dBm', 'mdi:wifi'],
+    'router_wifi_24G_txpwr': ['Transmit Power(2.4G)', 'dBm', 'mdi:signal'],
+    'router_wifi_5G_txpwr': ['Transmit Power(5G)', 'dBm', 'mdi:signal'],
+    'router_wifi_24G_stalist': ['Sta List(2.4G)', None, 'mdi:wifi'],
+    'router_wifi_5G_stalist': ['Sta List(5G)', None, 'mdi:wifi'],
 }
 _SS_COND = {
-    'router_ss_fs': ['Foreign State', None, 'mdi:send'],
-    'router_ss_cs': ['China State', None, 'mdi:send'],
+    'router_ss_fs': ['Foreign State', None, 'mdi:telegram'],
+    'router_ss_cs': ['China State', None, 'mdi:wall'],
 }
 
 _ROUTER_CONDITIONS = ['cpu', 'mem', 'net', 'wifi', 'bukemiaoshu']
@@ -89,6 +93,9 @@ _CMD_MEM = 'top -n 1 -b |grep ^Mem'
 _CMD_PPP0SPD = "cat /proc/net/dev |grep ppp0 |awk '{print $2,$10}'"
 _CMD_SSF = 'nvram get ss_foreign_state'
 _CMD_SSC = 'nvram get ss_china_state'
+_CMD_STALIST = 'wl assoclist'
+_CMD_24GSTALIST = 'wl autho_sta_list'
+_CMD_5GSTALIST = 'wl -i eth2 autho_sta_list'
 
 #_CMD_RSSI = wl -i eth1 rssi MAC
 
@@ -136,6 +143,10 @@ _REGEX_SSF = re.compile(
 _REGEX_SSC = re.compile(
     r'<.+>' +
     r'(?P<router_ss_cs>(.+))<.+>\s+')
+_REGEX_STALIST = re.compile(
+    r'\w+\s' +
+    r'(?P<mac>(([0-9A-F]{2}[:-]){5}([0-9A-F]{2})))')
+
 
 PLATFORM_SCHEMA = vol.All(
     cv.has_at_least_one_key(CONF_PASSWORD, CONF_PUB_KEY, CONF_SSH_KEY),
@@ -262,39 +273,47 @@ class AsusWrtSensor(Entity):
         """Get the latest data for the states."""
         if self._connection is not None:
             if self._id == 'router_name':
-                self._state = get_data_by(self._connection, _CMD_NAME, _REGEX_NAME).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_NAME, _REGEX_NAME).get(self._id)
             elif self._id in ['router_nowtime', 'router_uptime', 'router_cpu_1min_load', 'router_cpu_5min_load', 'router_cpu_15min_load']:
-                self._state = get_data_by(self._connection, _CMD_UPTIME, _REGEX_UPTIME).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_UPTIME, _REGEX_UPTIME).get(self._id)
             elif self._id == 'router_net_wan_ip':
-                self._state = get_data_by(self._connection, _CMD_WANIP, _REGEX_WANIP).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_WANIP, _REGEX_WANIP).get(self._id)
             elif self._id == 'router_net_lan_ip':
-                self._state = get_data_by(self._connection, _CMD_LANIP, _REGEX_LANIP).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_LANIP, _REGEX_LANIP).get(self._id)
             elif self._id == 'router_net_mac':
-                self._state = get_data_by(self._connection, _CMD_MAC, _REGEX_MAC).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_MAC, _REGEX_MAC).get(self._id)
             elif self._id == 'router_cpu_temp':
-                self._state = get_data_by(self._connection, _CMD_CPUTEMP, _REGEX_CPUTEMP).get(self._id)
-                self._state = correct_temperature_unit(self._state, self.tempunit)
+                self._state = get_data_dict(self._connection, _CMD_CPUTEMP, _REGEX_CPUTEMP).get(self._id)
+                self._state = correct_temperature_unit(self._state, self._tempunit)
             elif self._id == 'router_wifi_24G_temp':
-                self._state = get_data_by(self._connection, _CMD_24GTEMP, _REGEX_24GTEMP).get(self._id)
-                self._state = correct_temperature_unit(self._state, self.tempunit)
+                self._state = get_data_dict(self._connection, _CMD_24GTEMP, _REGEX_24GTEMP).get(self._id)
+                self._state = correct_temperature_unit(self._state, self._tempunit)
             elif self._id == 'router_wifi_5G_temp':
-                self._state = get_data_by(self._connection, _CMD_5GTEMP, _REGEX_5GTEMP).get(self._id)
-                self._state = correct_temperature_unit(self._state, self.tempunit)
+                self._state = get_data_dict(self._connection, _CMD_5GTEMP, _REGEX_5GTEMP).get(self._id)
+                self._state = correct_temperature_unit(self._state, self._tempunit)
             elif self._id == 'router_wifi_24G_txpwr':
-                self._state = get_data_by(self._connection, _CMD_24GTXPWR, _REGEX_24GTXPWR).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_24GTXPWR, _REGEX_24GTXPWR).get(self._id)
             elif self._id == 'router_wifi_5G_txpwr':
-                self._state = get_data_by(self._connection, _CMD_5GTXPWR, _REGEX_5GTXPWR).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_5GTXPWR, _REGEX_5GTXPWR).get(self._id)
+            elif self._id == 'router_wifi_24G_stalist':
+                stalist = get_data_list(self._connection, _CMD_24GSTALIST, _REGEX_STALIST, 'mac')
+                self._state = len(stalist)
+                self.attributes['sta_list'] = stalist
+            elif self._id == 'router_wifi_5G_stalist':
+                stalist = get_data_list(self._connection, _CMD_5GSTALIST, _REGEX_STALIST, 'mac')
+                self._state = len(stalist)
+                self.attributes['sta_list'] = stalist
             elif self._id in list(_MEM_COND.keys()):
-                self._state = get_data_by(self._connection, _CMD_MEM, _REGEX_MEM).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_MEM, _REGEX_MEM).get(self._id)
             elif self._id == 'router_net_wan_downspd':
-                rxnow = int(get_data_by(self._connection, _CMD_PPP0SPD, _REGEX_PPP0SPD).get('router_net_ppp0_rx'))
+                rxnow = int(get_data_dict(self._connection, _CMD_PPP0SPD, _REGEX_PPP0SPD).get('router_net_ppp0_rx'))
                 rtnow = datetime.datetime.now()
                 if self._rx != 0 :
                     drx = rxnow - self._rx
                     if drx <= 0:
                         drx += 4294967296
                     self._state = round((drx/((rtnow-self._rt).seconds)/1024),3)
-                    if self.state <= 0 :
+                    if self._state <= 0 :
                         self.attributes['debug_rx0'] = self._rx
                         self.attributes['debug_rxn'] = rxnow
                         self.attributes['debug_rt0'] = self._rt
@@ -304,14 +323,14 @@ class AsusWrtSensor(Entity):
                 self._rx = rxnow
                 self._rt = rtnow
             elif self._id == 'router_net_wan_upspd':
-                txnow = int(get_data_by(self._connection, _CMD_PPP0SPD, _REGEX_PPP0SPD).get('router_net_ppp0_tx'))
+                txnow = int(get_data_dict(self._connection, _CMD_PPP0SPD, _REGEX_PPP0SPD).get('router_net_ppp0_tx'))
                 ttnow = datetime.datetime.now()
                 if self._tx != 0 :
                     dtx = txnow - self._tx
                     if dtx <= 0:
                         dtx += 4294967296
                     self._state = round((dtx/((ttnow-self._tt).seconds)/1024),3)
-                    if self.state <= 0 :
+                    if self._state <= 0 :
                         self.attributes['debug_tx0'] = self._tx
                         self.attributes['debug_txn'] = txnow
                         self.attributes['debug_tt0'] = self._tt
@@ -321,9 +340,9 @@ class AsusWrtSensor(Entity):
                 self._tx = txnow
                 self._tt = ttnow
             elif self._id == 'router_ss_fs':
-                self._state = get_data_by(self._connection, _CMD_SSF, _REGEX_SSF).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_SSF, _REGEX_SSF).get(self._id)
             elif self._id == 'router_ss_cs':
-                self._state = get_data_by(self._connection, _CMD_SSC, _REGEX_SSC).get(self._id)
+                self._state = get_data_dict(self._connection, _CMD_SSC, _REGEX_SSC).get(self._id)
 
 
 
@@ -486,12 +505,12 @@ def _parse_lines(lines, regex):
     for line in lines:
         match = regex.search(line)
         if not match:
-            #_LOGGER.debug("Could not parse row: %s", line)
+            _LOGGER.debug("Could not parse row: %s", line)
             continue
         results.append(match.groupdict())
     return results
 
-def get_data_by(connection, cmd_line, regex_rule):
+def get_data_dict(connection, cmd_line, regex_rule):
     lines = connection.run_command(cmd_line)
     if not lines:
         return {}
@@ -499,6 +518,16 @@ def get_data_by(connection, cmd_line, regex_rule):
     data = {}
     for element in result:
         data.update(element)
+    return data
+
+def get_data_list(connection, cmd_line, regex_rule, key):
+    lines = connection.run_command(cmd_line)
+    if not lines:
+        return {}
+    result = _parse_lines(lines, regex_rule)
+    data = []
+    for element in result:
+        data.append(element.get(key).upper())
     return data
 
 def correct_temperature_unit(temp_c,temp_unit):
